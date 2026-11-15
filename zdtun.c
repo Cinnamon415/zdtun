@@ -24,6 +24,10 @@
 #include "zdtun.h"
 #include "utils.h"
 #include "socks5.h"
+#ifndef WIN32
+#include <sys/uio.h>
+#include <sys/socket.h>
+#endif
 #include "third_party/uthash.h"
 #include "third_party/net_headers.h"
 
@@ -85,6 +89,7 @@ typedef enum {
   PROXY_NONE = 0,
   PROXY_DNAT,
   PROXY_SOCKS5,
+  PROXY_UDP_RELAY,      // UDP through the SOCKS5 UDP ASSOCIATE relay of tun->udp_relay
 } proxy_mode_t;
 
 typedef struct {
@@ -153,6 +158,8 @@ typedef struct zdtun_t {
 
   char *socks5_user;
   char *socks5_pass;
+  uint8_t proxy_http;   // the proxy speaks HTTP CONNECT instead of SOCKS5
+  proxy_t udp_relay;    // SOCKS5 UDP relay (port 0 = none)
 
   zdtun_conn_t *conn_table;
   udp_mapping_t *udp_mappings;
@@ -208,6 +215,8 @@ static uint8_t sock_ipver(zdtun_t *tun, zdtun_conn_t *conn) {
     return conn->dnat->ipver;
   else if(conn->proxy_mode == PROXY_SOCKS5)
     return tun->socks5.ipver;
+  else if(conn->proxy_mode == PROXY_UDP_RELAY)
+    return tun->udp_relay.ipver;
   else
     return conn->tuple.ipver;
 }
@@ -363,6 +372,12 @@ void zdtun_set_socks5_proxy(zdtun_t *tun, const zdtun_ip_t *proxy_ip,
 
 /* ******************************************************* */
 
+void zdtun_set_proxy_http(zdtun_t *tun, uint8_t enabled) {
+  tun->proxy_http = enabled;
+}
+
+/* ******************************************************* */
+
 void zdtun_set_socks5_userpass(zdtun_t *tun, const char *username, const char *password) {
   free(tun->socks5_user);
   free(tun->socks5_pass);
@@ -407,6 +422,24 @@ void zdtun_conn_proxy(zdtun_conn_t *conn) {
   if(conn->tuple.ipproto == IPPROTO_TCP)
     conn->proxy_mode = PROXY_SOCKS5;
 }
+
+void zdtun_set_udp_relay(zdtun_t *tun, const zdtun_ip_t *relay_ip, uint16_t relay_port, uint8_t ipver) {
+  if(relay_ip)
+    tun->udp_relay.ip = *relay_ip;
+  tun->udp_relay.port = relay_port;
+  tun->udp_relay.ipver = ipver;
+}
+
+int zdtun_has_udp_relay(zdtun_t *tun) {
+  return tun->udp_relay.port != 0;
+}
+
+void zdtun_conn_udp_relay(zdtun_conn_t *conn) {
+  if(conn->tuple.ipproto == IPPROTO_UDP)
+    conn->proxy_mode = PROXY_UDP_RELAY;
+}
+
+/* ******************************************************* */
 
 void zdtun_conn_dnat(zdtun_conn_t *conn, const zdtun_ip_t *proxy_ip, uint16_t proxy_port, uint8_t ipver) {
   proxy_t *proxy;
@@ -1131,6 +1164,8 @@ static void fill_conn_sockaddr(zdtun_t *tun, zdtun_conn_t *conn,
     proxy = conn->dnat;
   else if(conn->proxy_mode == PROXY_SOCKS5)
     proxy = &tun->socks5;
+  else if(conn->proxy_mode == PROXY_UDP_RELAY)
+    proxy = &tun->udp_relay;
   else
     proxy = NULL;
 
@@ -1611,6 +1646,13 @@ static int handle_udp_fwd(zdtun_t *tun, const zdtun_pkt_t *pkt, zdtun_conn_t *co
   int family = (ipver == 4) ? PF_INET : PF_INET6;
 
   if(conn->status == CONN_STATUS_NEW) {
+    if((conn->proxy_mode == PROXY_UDP_RELAY) && (tun->udp_relay.port == 0)) {
+      // the relay went away before the first packet: go direct
+      conn->proxy_mode = PROXY_NONE;
+      ipver = sock_ipver(tun, conn);
+      family = (ipver == 4) ? PF_INET : PF_INET6;
+    }
+
     if((conn->proxy_mode == PROXY_NONE) && (ipver == 6) && is_ipv6_scoped_addr(conn->tuple.dst_ip.ip6.s6_addr)) {
       debug("Dropping UDP6 packet to a link-local scoped address");
       zdtun_conn_close(tun, conn, CONN_STATUS_UNREACHABLE);
@@ -1672,7 +1714,33 @@ static int handle_udp_fwd(zdtun_t *tun, const zdtun_pkt_t *pkt, zdtun_conn_t *co
   if(tun->callbacks.account_packet)
     tun->callbacks.account_packet(tun, pkt, 1 /* to zdtun */, conn);
 
-  if(send(conn->sock, pkt->l7, pkt->l7_len, 0) < 0) {
+  if(conn->proxy_mode == PROXY_UDP_RELAY) {
+    // RFC 1928 section 7: RSV(2) FRAG(1) ATYP(1) DST.ADDR DST.PORT DATA
+    char hdr_buf[22];
+    int hlen = 4;
+    hdr_buf[0] = hdr_buf[1] = hdr_buf[2] = 0;
+    if(conn->tuple.ipver == 4) {
+      hdr_buf[3] = 1;
+      memcpy(hdr_buf + 4, &conn->tuple.dst_ip.ip4, 4);
+      hlen += 4;
+    } else {
+      hdr_buf[3] = 4;
+      memcpy(hdr_buf + 4, &conn->tuple.dst_ip.ip6, 16);
+      hlen += 16;
+    }
+    memcpy(hdr_buf + hlen, &conn->tuple.dst_port, 2);
+    hlen += 2;
+
+    struct iovec iov[2] = {{hdr_buf, (size_t) hlen}, {pkt->l7, pkt->l7_len}};
+    struct msghdr msg = {0};
+    msg.msg_iov = iov;
+    msg.msg_iovlen = 2;
+
+    if(sendmsg(conn->sock, &msg, 0) < 0) {
+      close_with_socket_error(tun, conn, "UDP relay sendmsg");
+      return 0;
+    }
+  } else if(send(conn->sock, pkt->l7, pkt->l7_len, 0) < 0) {
     close_with_socket_error(tun, conn, "UDP sendto");
     return 0;
   }
@@ -1972,6 +2040,24 @@ static int handle_udp_reply(zdtun_t *tun, zdtun_conn_t *conn) {
   if(l4_len == SOCKET_ERROR) {
     close_with_socket_error(tun, conn, "UDP recv");
     return -1;
+  }
+
+  if(conn->proxy_mode == PROXY_UDP_RELAY) {
+    // strip the SOCKS5 UDP header (fragments are not supported and dropped)
+    int hlen;
+
+    if((l4_len < 4) || (payload_ptr[2] != 0))
+      return 0;
+    switch(payload_ptr[3]) {
+      case 1: hlen = 4 + 4 + 2; break;
+      case 4: hlen = 4 + 16 + 2; break;
+      case 3: hlen = 4 + 1 + (uint8_t)payload_ptr[4] + 2; break;
+      default: return 0;
+    }
+    if(l4_len < hlen)
+      return 0;
+    memmove(payload_ptr, payload_ptr + hlen, l4_len - hlen);
+    l4_len -= hlen;
   }
 
   // Reconstruct the UDP header

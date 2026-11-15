@@ -503,6 +503,20 @@ void zdtun_set_socks5_proxy(zdtun_t *tun, const zdtun_ip_t *proxy_ip, uint16_t p
  */
 void zdtun_set_socks5_userpass(zdtun_t *tun, const char *username, const char *password);
 
+/*
+ * Use an HTTP CONNECT proxy (RFC 9110 9.3.6) at the address given to zdtun_set_socks5_proxy instead
+ * of a SOCKS5 one. The credentials of zdtun_set_socks5_userpass are sent as Basic auth.
+ */
+void zdtun_set_proxy_http(zdtun_t *tun, uint8_t enabled);
+
+/*
+ * SOCKS5 UDP relay (from a UDP ASSOCIATE kept open by the caller). relay_port 0 disables it.
+ * zdtun_conn_udp_relay marks a new UDP connection to be sent through it.
+ */
+void zdtun_set_udp_relay(zdtun_t *tun, const zdtun_ip_t *relay_ip, uint16_t relay_port, uint8_t ipver);
+int zdtun_has_udp_relay(zdtun_t *tun);
+void zdtun_conn_udp_relay(zdtun_conn_t *conn);
+
 /* Connection methods */
 void* zdtun_conn_get_userdata(const zdtun_conn_t *conn);
 void zdtun_conn_set_userdata(zdtun_conn_t *conn, void *userdata);

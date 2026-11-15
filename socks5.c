@@ -62,7 +62,13 @@ typedef enum {
 
 /* ******************************************************* */
 
+static int http_connect(zdtun_t *tun, zdtun_conn_t *conn);
+static int handle_http_reply(zdtun_t *tun, zdtun_conn_t *conn, char *data, int len);
+
 int socks5_connect(zdtun_t *tun, zdtun_conn_t *conn) {
+  if(tun->proxy_http)
+    return http_connect(tun, conn);
+
   // ver, nauth, no_auth|username_password
   uint8_t hello[] = {5, 1, tun->socks5_user ? SOCKS5_AUTH_USERNAME_PASSWORD : 0};
 
@@ -141,6 +147,9 @@ static int socks5_req(zdtun_t *tun, zdtun_conn_t *conn) {
 /* ******************************************************* */
 
 int handle_socks5_reply(zdtun_t *tun, zdtun_conn_t *conn, char *data, int len) {
+  if(tun->proxy_http)
+    return handle_http_reply(tun, conn, data, len);
+
   if(conn->socks5_status == SOCKS5_HELLO) {
     struct socks5_srv_choice *reply = (struct socks5_srv_choice*) data;
 
@@ -244,4 +253,108 @@ int handle_socks5_reply(zdtun_t *tun, zdtun_conn_t *conn, char *data, int len) {
     zdtun_conn_close(tun, conn, CONN_STATUS_SOCKS5_ERROR);
     return -1;
   }
+}
+
+/* ******************************************************* */
+/* HTTP CONNECT proxy (shares the SOCKS5 states: CONNECTING = waiting for the status line,
+ * SKIP_BND = skipping the response headers, ESTABLISHED = tunnel open). */
+
+static int base64(const char *in, int len, char *out) {
+  static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  int o = 0;
+
+  for(int i = 0; i < len; i += 3) {
+    uint32_t v = ((uint8_t)in[i]) << 16;
+    if(i + 1 < len) v |= ((uint8_t)in[i + 1]) << 8;
+    if(i + 2 < len) v |= (uint8_t)in[i + 2];
+    out[o++] = tbl[(v >> 18) & 63];
+    out[o++] = tbl[(v >> 12) & 63];
+    out[o++] = (i + 1 < len) ? tbl[(v >> 6) & 63] : '=';
+    out[o++] = (i + 2 < len) ? tbl[v & 63] : '=';
+  }
+  out[o] = '\0';
+  return o;
+}
+
+static int http_connect(zdtun_t *tun, zdtun_conn_t *conn) {
+  char addr[INET6_ADDRSTRLEN];
+  char req[768];
+  int n;
+
+  inet_ntop((conn->tuple.ipver == 4) ? AF_INET : AF_INET6, &conn->tuple.dst_ip, addr, sizeof(addr));
+
+  if(conn->tuple.ipver == 4)
+    n = snprintf(req, sizeof(req), "CONNECT %s:%u HTTP/1.1\r\nHost: %s:%u\r\n",
+                 addr, ntohs(conn->tuple.dst_port), addr, ntohs(conn->tuple.dst_port));
+  else
+    n = snprintf(req, sizeof(req), "CONNECT [%s]:%u HTTP/1.1\r\nHost: [%s]:%u\r\n",
+                 addr, ntohs(conn->tuple.dst_port), addr, ntohs(conn->tuple.dst_port));
+
+  if(tun->socks5_user && tun->socks5_pass) {
+    char cred[256], b64[400];
+    int clen = snprintf(cred, sizeof(cred), "%s:%s", tun->socks5_user, tun->socks5_pass);
+
+    if(clen > 0 && clen < (int)sizeof(cred)) {
+      base64(cred, clen, b64);
+      n += snprintf(req + n, sizeof(req) - n, "Proxy-Authorization: Basic %s\r\n", b64);
+    }
+  }
+  n += snprintf(req + n, sizeof(req) - n, "\r\n");
+
+  if(send(conn->sock, req, n, 0) < 0)
+    return close_with_socket_error(tun, conn, "HTTP CONNECT send");
+
+  conn->socks5_status = SOCKS5_CONNECTING;
+  conn->socks5_skip = 0;
+  return 0;
+}
+
+static int handle_http_reply(zdtun_t *tun, zdtun_conn_t *conn, char *data, int len) {
+  int i = 0;
+
+  if(conn->socks5_status == SOCKS5_CONNECTING) {
+    // "HTTP/1.x 200 ..."
+    if((len < 12) || (strncmp(data, "HTTP/1.", 7) != 0)) {
+      error("invalid HTTP CONNECT reply");
+      zdtun_conn_close(tun, conn, CONN_STATUS_SOCKS5_ERROR);
+      return -1;
+    }
+
+    int code = atoi(data + 9);
+    if(code != 200) {
+      debug("HTTP CONNECT failed with code %d", code);
+      zdtun_conn_close(tun, conn, ((code == 502) || (code == 503) || (code == 504)) ?
+                       CONN_STATUS_UNREACHABLE : CONN_STATUS_SOCKS5_ERROR);
+      return ((code >= 502) && (code <= 504)) ? 0 : -1;
+    }
+
+    conn->socks5_status = SOCKS5_SKIP_BND;
+    conn->socks5_skip = 0;  // progress in matching the "\r\n\r\n" end of the headers
+  }
+
+  if(conn->socks5_status == SOCKS5_SKIP_BND) {
+    static const char end[] = "\r\n\r\n";
+
+    for(; i < len; i++) {
+      if(data[i] == end[conn->socks5_skip])
+        conn->socks5_skip++;
+      else
+        conn->socks5_skip = (data[i] == '\r') ? 1 : 0;
+
+      if(conn->socks5_skip == 4) {
+        conn->socks5_status = SOCKS5_ESTABLISHED;
+        i++;
+        break;
+      }
+    }
+
+    if((conn->socks5_status == SOCKS5_ESTABLISHED) && (i < len))
+      error("HTTP CONNECT: %d bytes after the headers were dropped", len - i);
+
+    return 0;
+  }
+
+  error("invalid HTTP CONNECT status: %d", conn->socks5_status);
+  zdtun_conn_close(tun, conn, CONN_STATUS_SOCKS5_ERROR);
+  return -1;
 }
